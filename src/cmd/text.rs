@@ -3,6 +3,15 @@ use lopdf::{Document, content::Content};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[derive(Clone, Debug)]
+pub(crate) struct TextRun {
+    pub x: f32,
+    pub y: f32,
+    pub font_name: String,
+    pub font_size: f32,
+    pub text: String,
+}
+
 // ──────────────────────────────────────────────
 // ToUnicode CMap 解析
 // ──────────────────────────────────────────────
@@ -244,6 +253,87 @@ pub(crate) fn build_cmap_table(
     table
 }
 
+pub(crate) fn extract_page_text_runs(doc: &Document, page: u32) -> anyhow::Result<Vec<TextRun>> {
+    let page_id = get_page_id(doc, page)?;
+    let raw = doc.get_page_content(page_id)?;
+    let content = Content::decode(&raw)?;
+    let cmap_table = build_cmap_table(doc, page_id);
+    let (mut cx, mut cy, mut lx, mut ly) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut font_size = 12.0f32;
+    let mut font_name = String::new();
+    let mut runs = Vec::new();
+
+    for op in &content.operations {
+        match op.operator.as_str() {
+            "BT" => {
+                cx = 0.0;
+                cy = 0.0;
+                lx = 0.0;
+                ly = 0.0;
+            }
+            "Tm" if op.operands.len() >= 6 => {
+                cx = op.operands[4].as_f32().unwrap_or(0.0);
+                cy = op.operands[5].as_f32().unwrap_or(0.0);
+                lx = cx;
+                ly = cy;
+            }
+            "Td" | "TD" if op.operands.len() >= 2 => {
+                lx += op.operands[0].as_f32().unwrap_or(0.0);
+                ly += op.operands[1].as_f32().unwrap_or(0.0);
+                cx = lx;
+                cy = ly;
+            }
+            "Tf" if op.operands.len() >= 2 => {
+                font_name = op.operands[0]
+                    .as_name()
+                    .map(|n| String::from_utf8_lossy(n).to_string())
+                    .unwrap_or_default();
+                font_size = op.operands[1].as_f32().unwrap_or(font_size);
+            }
+            "Tj" => {
+                if let Some(bytes) = op.operands.first().and_then(|v| v.as_str().ok()) {
+                    let cmap = cmap_table.get(&font_name);
+                    let txt = decode_bytes_with_cmap(bytes, cmap);
+                    let txt = txt.trim().to_string();
+                    if !txt.is_empty() {
+                        runs.push(TextRun {
+                            x: cx,
+                            y: cy,
+                            font_name: font_name.clone(),
+                            font_size,
+                            text: txt,
+                        });
+                    }
+                }
+            }
+            "TJ" => {
+                let cmap = cmap_table.get(&font_name);
+                let mut txt = String::new();
+                if let Some(arr) = op.operands.first().and_then(|v| v.as_array().ok()) {
+                    for item in arr {
+                        if let Ok(bs) = item.as_str() {
+                            txt.push_str(&decode_bytes_with_cmap(bs, cmap));
+                        }
+                    }
+                }
+                let txt = txt.trim().to_string();
+                if !txt.is_empty() {
+                    runs.push(TextRun {
+                        x: cx,
+                        y: cy,
+                        font_name: font_name.clone(),
+                        font_size,
+                        text: txt,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(runs)
+}
+
 pub fn text_info(
     input: PathBuf,
     page: u32,
@@ -259,72 +349,12 @@ pub fn text_info(
         vec![page]
     };
     for cur_page in pages_to_run {
-        let page_id = get_page_id(&doc, cur_page)?;
-        let raw = doc.get_page_content(page_id)?;
-        let content = Content::decode(&raw)?;
-        // 为当前页构建 ToUnicode CMap 表
-        let cmap_table = build_cmap_table(&doc, page_id);
         println!("\n====== 第 {} 页 ======", cur_page);
-        let (mut cx, mut cy, mut lx, mut ly) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let mut font_size = 12.0f32;
-        let mut font_name = String::new();
-        for op in &content.operations {
-            match op.operator.as_str() {
-                "BT" => {
-                    cx = 0.0;
-                    cy = 0.0;
-                    lx = 0.0;
-                    ly = 0.0;
-                }
-                "Tm" if op.operands.len() >= 6 => {
-                    cx = op.operands[4].as_f32().unwrap_or(0.0);
-                    cy = op.operands[5].as_f32().unwrap_or(0.0);
-                    lx = cx;
-                    ly = cy;
-                }
-                "Td" | "TD" if op.operands.len() >= 2 => {
-                    lx += op.operands[0].as_f32().unwrap_or(0.0);
-                    ly += op.operands[1].as_f32().unwrap_or(0.0);
-                    cx = lx;
-                    cy = ly;
-                }
-                "Tf" if op.operands.len() >= 2 => {
-                    font_name = op.operands[0]
-                        .as_name()
-                        .map(|n| String::from_utf8_lossy(n).to_string())
-                        .unwrap_or_default();
-                    font_size = op.operands[1].as_f32().unwrap_or(font_size);
-                }
-                "Tj" => {
-                    if let Some(bytes) = op.operands.first().and_then(|v| v.as_str().ok()) {
-                        let cmap = cmap_table.get(&font_name);
-                        let txt = decode_bytes_with_cmap(bytes, cmap);
-                        println!(
-                            "  ({:.1},{:.1}) /{} {}pt  \"{}\"",
-                            cx, cy, font_name, font_size, txt
-                        );
-                    }
-                }
-                "TJ" => {
-                    let cmap = cmap_table.get(&font_name);
-                    let mut txt = String::new();
-                    if let Some(arr) = op.operands.first().and_then(|v| v.as_array().ok()) {
-                        for item in arr {
-                            if let Ok(bs) = item.as_str() {
-                                txt.push_str(&decode_bytes_with_cmap(bs, cmap));
-                            }
-                            // 数字间距调整，忽略
-                        }
-                    }
-                    if !txt.is_empty() {
-                        println!(
-                            "  ({:.1},{:.1}) /{} {}pt  \"{}\"",
-                            cx, cy, font_name, font_size, txt
-                        );
-                    }
-                }
-                _ => {}
-            }
+        for run in extract_page_text_runs(&doc, cur_page)? {
+            println!(
+                "  ({:.1},{:.1}) /{} {}pt  \"{}\"",
+                run.x, run.y, run.font_name, run.font_size, run.text
+            );
         }
     }
     Ok(())

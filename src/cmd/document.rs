@@ -1,4 +1,5 @@
 use lopdf::{Document, Object, ObjectId};
+use regex::Regex;
 use std::path::PathBuf;
 
 pub fn doc_info(input: PathBuf, password: &Option<String>) -> anyhow::Result<()> {
@@ -81,6 +82,85 @@ pub fn outline(
     } else {
         println!("（大纲为空）");
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn auto_outline(
+    input: PathBuf,
+    output: PathBuf,
+    title_prefix: String,
+    detect_headings: bool,
+    hierarchical: bool,
+    preview_headings: bool,
+    min_font_size: f32,
+    max_per_page: usize,
+    chapter_pattern: Option<String>,
+    section_pattern: Option<String>,
+    subsection_pattern: Option<String>,
+    fallback_to_pages: bool,
+    force: bool,
+    password: &Option<String>,
+) -> anyhow::Result<()> {
+    let mut doc = crate::util::load_document(&input, password)?;
+    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+
+    let has_outline = doc.get_object(root_id)?.as_dict()?.get(b"Outlines").is_ok();
+    if has_outline && !force {
+        anyhow::bail!("该文档已经有目录；如需覆盖请显式传入 --force");
+    }
+
+    let pages = doc.get_pages();
+    if pages.is_empty() {
+        anyhow::bail!("文档没有可用页面，无法生成目录");
+    }
+
+    let custom_patterns = CustomPatterns::compile(
+        chapter_pattern.as_deref(),
+        section_pattern.as_deref(),
+        subsection_pattern.as_deref(),
+    )?;
+
+    let mut entries = if detect_headings {
+        let toc_entries = detect_toc_outline_entries(&doc, hierarchical, &custom_patterns)?;
+        if !toc_entries.is_empty() {
+            toc_entries
+        } else {
+            detect_outline_entries(
+                &doc,
+                min_font_size,
+                max_per_page,
+                hierarchical,
+                &custom_patterns,
+            )?
+        }
+    } else {
+        Vec::new()
+    };
+    if entries.is_empty() {
+        if detect_headings && !fallback_to_pages {
+            anyhow::bail!("未检测到可用标题；可调低 --min-font-size 或加 --fallback-to-pages");
+        }
+        entries = build_page_outline_entries(&pages, &title_prefix);
+    }
+
+    if preview_headings {
+        if !detect_headings {
+            anyhow::bail!("--preview-headings 需要配合 --detect-headings 使用");
+        }
+        print_heading_preview(&doc, &entries);
+        return Ok(());
+    }
+
+    let outline_root_id = next_object_id(&mut doc);
+    write_outline_tree(&mut doc, outline_root_id, &entries)?;
+
+    let root = doc.get_object_mut(root_id)?.as_dict_mut()?;
+    root.set("Outlines", outline_root_id);
+    root.set("PageMode", Object::Name(b"UseOutlines".to_vec()));
+
+    crate::util::save_document(&mut doc, output)?;
+    println!("✅ 已生成目录，共 {} 个书签。", entries.len());
     Ok(())
 }
 
@@ -171,6 +251,634 @@ fn page_from_ref(doc: &Document, page_ref: ObjectId) -> Option<u32> {
         }
     }
     None
+}
+
+fn next_object_id(doc: &mut Document) -> ObjectId {
+    doc.max_id += 1;
+    (doc.max_id, 0)
+}
+
+struct OutlineEntry {
+    title: String,
+    page_id: ObjectId,
+    level: usize,
+}
+
+fn build_page_outline_entries(
+    pages: &std::collections::BTreeMap<u32, ObjectId>,
+    title_prefix: &str,
+) -> Vec<OutlineEntry> {
+    let mut page_entries: Vec<(u32, ObjectId)> = pages.iter().map(|(n, id)| (*n, *id)).collect();
+    page_entries.sort_by_key(|(n, _)| *n);
+    page_entries
+        .into_iter()
+        .map(|(page_num, page_id)| OutlineEntry {
+            title: format!("{} {} 页", title_prefix, page_num),
+            page_id,
+            level: 1,
+        })
+        .collect()
+}
+
+fn detect_outline_entries(
+    doc: &Document,
+    min_font_size: f32,
+    max_per_page: usize,
+    hierarchical: bool,
+    custom_patterns: &CustomPatterns,
+) -> anyhow::Result<Vec<OutlineEntry>> {
+    let mut entries = Vec::new();
+    let pages_map = doc.get_pages();
+    let mut page_nums: Vec<u32> = pages_map.keys().cloned().collect();
+    page_nums.sort_unstable();
+
+    for page_num in page_nums {
+        let page_id = *pages_map
+            .get(&page_num)
+            .ok_or_else(|| anyhow::anyhow!("页码 {} 不存在", page_num))?;
+        let runs = crate::cmd::text::extract_page_text_runs(doc, page_num)?;
+        let mut lines = merge_text_runs_into_lines(runs);
+        lines = merge_multiline_candidates(lines);
+        lines.retain(|line| {
+            line.font_size >= min_font_size
+                && line.text.chars().count() <= 120
+                && !line.text.trim().is_empty()
+                && !is_header_footer_noise(&line.text, line.y)
+                && !is_likely_noise(&line.text)
+        });
+        promote_thesis_heading_lines(&mut lines);
+        lines.sort_by(|a, b| {
+            b.font_size
+                .partial_cmp(&a.font_size)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| b.text.chars().count().cmp(&a.text.chars().count()))
+        });
+        lines.truncate(max_per_page.max(1));
+        lines.sort_by(|a, b| {
+            b.y.partial_cmp(&a.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for line in lines {
+            let title = normalize_outline_title(&line.text);
+            entries.push(OutlineEntry {
+                level: if hierarchical {
+                    detect_heading_level(&title, line.font_size, custom_patterns)
+                } else {
+                    1
+                },
+                title,
+                page_id,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn detect_toc_outline_entries(
+    doc: &Document,
+    hierarchical: bool,
+    custom_patterns: &CustomPatterns,
+) -> anyhow::Result<Vec<OutlineEntry>> {
+    let pages_map = doc.get_pages();
+    let mut page_nums: Vec<u32> = pages_map.keys().cloned().collect();
+    page_nums.sort_unstable();
+    let mut entries = Vec::new();
+    let total_pages = pages_map.len() as u32;
+    let mut in_toc = false;
+
+    for page_num in page_nums {
+        let runs = crate::cmd::text::extract_page_text_runs(doc, page_num)?;
+        let mut lines = merge_text_runs_into_lines(runs);
+        lines.retain(|line| !is_likely_noise(&line.text));
+        let is_toc_page = lines.iter().any(|line| is_toc_heading(&line.text));
+        let toc_like_count = lines
+            .iter()
+            .filter(|line| parse_toc_line(&line.text).is_some())
+            .count();
+        let is_toc_continuation = in_toc && toc_like_count >= 3;
+        if !is_toc_page && !is_toc_continuation {
+            if in_toc {
+                break;
+            }
+            continue;
+        }
+        in_toc = true;
+
+        let mut page_entries = 0usize;
+        for line in lines {
+            if let Some((title, target_page)) = parse_toc_line(&line.text) {
+                if target_page < 1 || target_page > total_pages {
+                    continue;
+                }
+                if let Some(&page_id) = pages_map.get(&target_page) {
+                    let level = if hierarchical {
+                        detect_heading_level(&title, line.font_size, custom_patterns)
+                    } else {
+                        1
+                    };
+                    entries.push(OutlineEntry {
+                        title,
+                        page_id,
+                        level,
+                    });
+                    page_entries += 1;
+                }
+            }
+        }
+        if in_toc && page_entries == 0 {
+            break;
+        }
+    }
+
+    Ok(entries)
+}
+
+#[derive(Clone)]
+struct LineCandidate {
+    x: f32,
+    y: f32,
+    font_size: f32,
+    text: String,
+}
+
+fn merge_text_runs_into_lines(runs: Vec<crate::cmd::text::TextRun>) -> Vec<LineCandidate> {
+    let mut sorted = runs;
+    sorted.sort_by(|a, b| {
+        b.y.partial_cmp(&a.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut lines: Vec<Vec<crate::cmd::text::TextRun>> = Vec::new();
+    for run in sorted {
+        if let Some(line) = lines.last_mut() {
+            let y_close = (line[0].y - run.y).abs() <= 3.0;
+            let size_close = (line[0].font_size - run.font_size).abs() <= 1.0;
+            if y_close && size_close {
+                line.push(run);
+                continue;
+            }
+        }
+        lines.push(vec![run]);
+    }
+
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            let x = line.first().map(|r| r.x).unwrap_or(0.0);
+            let y = line.first().map(|r| r.y).unwrap_or(0.0);
+            let font_size = line
+                .iter()
+                .map(|r| r.font_size)
+                .fold(0.0f32, |acc, v| acc.max(v));
+            let text = line
+                .iter()
+                .map(|r| r.text.trim())
+                .collect::<Vec<_>>()
+                .join("");
+            LineCandidate {
+                x,
+                y,
+                font_size,
+                text,
+            }
+        })
+        .collect()
+}
+
+fn merge_multiline_candidates(lines: Vec<LineCandidate>) -> Vec<LineCandidate> {
+    if lines.is_empty() {
+        return lines;
+    }
+    let mut sorted = lines;
+    sorted.sort_by(|a, b| {
+        b.y.partial_cmp(&a.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut merged: Vec<LineCandidate> = Vec::new();
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let cur = &sorted[i];
+        if i + 1 < sorted.len() && should_merge_lines(cur, &sorted[i + 1]) {
+            let next = &sorted[i + 1];
+            merged.push(LineCandidate {
+                x: cur.x.min(next.x),
+                y: cur.y.max(next.y),
+                font_size: cur.font_size.max(next.font_size),
+                text: format!("{}{}", cur.text.trim_end(), next.text.trim_start()),
+            });
+            i += 2;
+            continue;
+        }
+        merged.push(cur.clone());
+        i += 1;
+    }
+    merged
+}
+
+fn should_merge_lines(a: &LineCandidate, b: &LineCandidate) -> bool {
+    let size_close = (a.font_size - b.font_size).abs() <= 1.5;
+    let x_close = (a.x - b.x).abs() <= 90.0
+        || (looks_like_thesis_title_line(a.text.trim()) && (a.x - b.x).abs() <= 180.0);
+    let y_gap = (a.y - b.y).abs();
+    let plausible_gap = (8.0..=42.0).contains(&y_gap);
+    let a_len = a.text.chars().count();
+    let b_len = b.text.chars().count();
+    let continuation = !ends_like_complete_heading(&a.text)
+        || b_len <= 24
+        || a_len <= 24
+        || looks_like_thesis_title_line(a.text.trim());
+    size_close && x_close && plausible_gap && continuation
+}
+
+fn ends_like_complete_heading(s: &str) -> bool {
+    let t = s.trim();
+    t.ends_with('。')
+        || t.ends_with('！')
+        || t.ends_with('？')
+        || t.ends_with("摘要")
+        || t.ends_with("引言")
+        || t.ends_with("致谢")
+        || t.ends_with("参考文献")
+}
+
+fn promote_thesis_heading_lines(lines: &mut [LineCandidate]) {
+    for line in lines {
+        let t = line.text.trim();
+        if is_thesis_anchor_heading(t) {
+            line.font_size = line.font_size.max(24.0);
+        }
+        if looks_like_thesis_title_line(t) {
+            line.font_size = line.font_size.max(22.0);
+        }
+    }
+}
+
+fn is_thesis_anchor_heading(s: &str) -> bool {
+    matches_fixed_heading(s)
+        || s.contains("毕业论文")
+        || s.contains("毕业设计")
+        || s.contains("学位论文")
+}
+
+fn looks_like_thesis_title_line(s: &str) -> bool {
+    s.starts_with("题目")
+        || s.starts_with("论文题目")
+        || s.starts_with("设计题目")
+        || s.starts_with("Title")
+}
+
+fn normalize_outline_title(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_toc_heading(s: &str) -> bool {
+    let t = normalize_outline_title(s);
+    t == "目录" || t.eq_ignore_ascii_case("contents") || t.eq_ignore_ascii_case("table of contents")
+}
+
+fn parse_toc_line(s: &str) -> Option<(String, u32)> {
+    let compact = normalize_outline_title(s);
+    if compact.is_empty() || is_toc_heading(&compact) {
+        return None;
+    }
+    let re = Regex::new(r"^(?P<title>.+?)(?:\.|·|…|\s)+(?P<page>\d{1,4})$").ok()?;
+    let caps = re.captures(&compact)?;
+    let raw_title = caps.name("title")?.as_str().trim();
+    let page: u32 = caps.name("page")?.as_str().parse().ok()?;
+    let title = raw_title
+        .trim_end_matches(['.', '·', '…'])
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+    Some((title, page))
+}
+
+fn detect_heading_level(title: &str, font_size: f32, custom_patterns: &CustomPatterns) -> usize {
+    let t = title.trim();
+    if custom_patterns
+        .chapter
+        .as_ref()
+        .is_some_and(|re| re.is_match(t))
+    {
+        return 1;
+    }
+    if custom_patterns
+        .section
+        .as_ref()
+        .is_some_and(|re| re.is_match(t))
+    {
+        return 2;
+    }
+    if custom_patterns
+        .subsection
+        .as_ref()
+        .is_some_and(|re| re.is_match(t))
+    {
+        return 3;
+    }
+    if matches_chapter_like(t) {
+        return 1;
+    }
+    if matches_section_like(t) {
+        return 2;
+    }
+    if matches_subsection_like(t) {
+        return 3;
+    }
+    if font_size >= 22.0 {
+        1
+    } else if font_size >= 18.0 {
+        2
+    } else {
+        3
+    }
+}
+
+fn matches_chapter_like(s: &str) -> bool {
+    starts_with_any(
+        s,
+        &["第"],
+        &["章", "篇", "部分", "卷", "回", "编", "幕", "课", "讲"],
+    ) || starts_with_ascii_prefix(s, &["chapter ", "part ", "unit "])
+        || starts_with_cn_list_marker(s)
+        || leading_number_segments(s) == 1
+        || matches_fixed_heading(s)
+}
+
+fn matches_section_like(s: &str) -> bool {
+    starts_with_any(s, &["第"], &["节", "条"]) || leading_number_segments(s) == 2
+}
+
+fn matches_subsection_like(s: &str) -> bool {
+    leading_number_segments(s) >= 3 || starts_with_ascii_prefix(s, &["section ", "sec. "])
+}
+
+fn starts_with_any(s: &str, prefixes: &[&str], suffixes: &[&str]) -> bool {
+    prefixes.iter().any(|p| s.starts_with(p)) && suffixes.iter().any(|suf| s.contains(suf))
+}
+
+fn starts_with_ascii_prefix(s: &str, prefixes: &[&str]) -> bool {
+    let lower = s.to_ascii_lowercase();
+    prefixes.iter().any(|p| lower.starts_with(p))
+}
+
+fn starts_with_cn_list_marker(s: &str) -> bool {
+    let numerals = [
+        "一、",
+        "二、",
+        "三、",
+        "四、",
+        "五、",
+        "六、",
+        "七、",
+        "八、",
+        "九、",
+        "十、",
+        "十一、",
+        "十二、",
+    ];
+    numerals.iter().any(|p| s.starts_with(p))
+}
+
+fn leading_number_segments(s: &str) -> usize {
+    let mut count = 0usize;
+    let chars: Vec<char> = s.trim().chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        count += 1;
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    count
+}
+
+fn is_likely_noise(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.chars().count() <= 1 {
+        return true;
+    }
+    if t.starts_with("学号")
+        || t.starts_with("姓名")
+        || t.starts_with("学生姓名")
+        || t.starts_with("学院名称")
+        || t.starts_with("专业名称")
+        || t.starts_with("指导教师")
+        || t.starts_with("学院名")
+        || t.starts_with("专业名")
+        || t.starts_with("学生姓")
+        || t.starts_with("指导教")
+        || t.starts_with("关键词")
+        || t.starts_with("Key words")
+    {
+        return true;
+    }
+    if t.chars()
+        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    {
+        return true;
+    }
+    false
+}
+
+fn is_header_footer_noise(text: &str, y: f32) -> bool {
+    let t = text.trim();
+    if y > 740.0 && t.chars().count() <= 20 {
+        return true;
+    }
+    if y < 80.0 && (looks_like_page_number(t) || looks_like_date_line(t)) {
+        return true;
+    }
+    false
+}
+
+fn looks_like_page_number(s: &str) -> bool {
+    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '-' || c == '—');
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '/')
+}
+
+fn looks_like_date_line(s: &str) -> bool {
+    s.contains("年") || s.contains("月") || s.to_ascii_lowercase().contains("202")
+}
+
+fn matches_fixed_heading(s: &str) -> bool {
+    let t = s.trim();
+    [
+        "摘要",
+        "Abstract",
+        "引言",
+        "前言",
+        "绪论",
+        "结论",
+        "结束语",
+        "参考文献",
+        "致谢",
+        "附录",
+    ]
+    .iter()
+    .any(|h| t == *h || t.starts_with(&format!("{}{}", h, "：")) || t.starts_with(h))
+}
+
+struct CustomPatterns {
+    chapter: Option<Regex>,
+    section: Option<Regex>,
+    subsection: Option<Regex>,
+}
+
+impl CustomPatterns {
+    fn compile(
+        chapter: Option<&str>,
+        section: Option<&str>,
+        subsection: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            chapter: compile_optional_regex(chapter, "--chapter-pattern")?,
+            section: compile_optional_regex(section, "--section-pattern")?,
+            subsection: compile_optional_regex(subsection, "--subsection-pattern")?,
+        })
+    }
+}
+
+fn compile_optional_regex(pattern: Option<&str>, flag: &str) -> anyhow::Result<Option<Regex>> {
+    match pattern {
+        Some(p) => Regex::new(p)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{} 正则无效: {}", flag, e)),
+        None => Ok(None),
+    }
+}
+
+fn print_heading_preview(doc: &Document, entries: &[OutlineEntry]) {
+    if entries.is_empty() {
+        println!("（未识别到任何标题）");
+        return;
+    }
+    for entry in entries {
+        let page = page_from_ref(doc, entry.page_id).unwrap_or(0);
+        let indent = "  ".repeat(entry.level.saturating_sub(1));
+        println!("{}[L{}] 第{}页 {}", indent, entry.level, page, entry.title);
+    }
+}
+
+fn write_outline_tree(
+    doc: &mut Document,
+    outline_root_id: ObjectId,
+    entries: &[OutlineEntry],
+) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        anyhow::bail!("没有可写入的目录项");
+    }
+
+    let ids: Vec<ObjectId> = (0..entries.len()).map(|_| next_object_id(doc)).collect();
+    let levels: Vec<usize> = entries.iter().map(|e| e.level.max(1)).collect();
+    let mut parents = vec![outline_root_id; entries.len()];
+    let mut first_child: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut last_child: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut prev_sibling: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut next_sibling: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut root_children: Vec<usize> = Vec::new();
+    let mut child_counts: Vec<usize> = vec![0; entries.len()];
+    let mut stack: Vec<usize> = Vec::new();
+
+    for i in 0..entries.len() {
+        while let Some(&last) = stack.last() {
+            if levels[last] >= levels[i] {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+
+        if let Some(&parent_idx) = stack.last() {
+            parents[i] = ids[parent_idx];
+            if let Some(prev) = last_child[parent_idx] {
+                prev_sibling[i] = Some(prev);
+                next_sibling[prev] = Some(i);
+            } else {
+                first_child[parent_idx] = Some(i);
+            }
+            last_child[parent_idx] = Some(i);
+            child_counts[parent_idx] += 1;
+        } else {
+            if let Some(&prev_root) = root_children.last() {
+                prev_sibling[i] = Some(prev_root);
+                next_sibling[prev_root] = Some(i);
+            }
+            root_children.push(i);
+        }
+
+        stack.push(i);
+    }
+
+    for i in 0..entries.len() {
+        let mut item = lopdf::Dictionary::new();
+        item.set("Title", pdf_unicode_string(&entries[i].title));
+        item.set("Parent", parents[i]);
+        item.set(
+            "Dest",
+            Object::Array(vec![
+                Object::Reference(entries[i].page_id),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        if let Some(prev) = prev_sibling[i] {
+            item.set("Prev", ids[prev]);
+        }
+        if let Some(next) = next_sibling[i] {
+            item.set("Next", ids[next]);
+        }
+        if let Some(first) = first_child[i] {
+            item.set("First", ids[first]);
+        }
+        if let Some(last) = last_child[i] {
+            item.set("Last", ids[last]);
+        }
+        if child_counts[i] > 0 {
+            item.set("Count", child_counts[i] as i64);
+        }
+        doc.objects.insert(ids[i], Object::Dictionary(item));
+    }
+
+    let mut outlines = lopdf::Dictionary::new();
+    outlines.set("Type", Object::Name(b"Outlines".to_vec()));
+    outlines.set("First", ids[*root_children.first().unwrap()]);
+    outlines.set("Last", ids[*root_children.last().unwrap()]);
+    outlines.set("Count", root_children.len() as i64);
+    doc.objects
+        .insert(outline_root_id, Object::Dictionary(outlines));
+    Ok(())
+}
+
+fn pdf_unicode_string(s: &str) -> Object {
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in s.encode_utf16() {
+        bytes.push((unit >> 8) as u8);
+        bytes.push((unit & 0xFF) as u8);
+    }
+    Object::String(bytes, lopdf::StringFormat::Hexadecimal)
 }
 
 // ─────────────────────────────────────────────────────────────

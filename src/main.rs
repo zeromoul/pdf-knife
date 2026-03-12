@@ -315,6 +315,46 @@ enum Commands {
         #[arg(long)]
         depth: Option<usize>,
     },
+    /// 为没有目录的 PDF 自动生成书签目录（默认每页一个书签）
+    AutoOutline {
+        /// 输入 PDF 文件路径
+        input: PathBuf,
+        /// 输出 PDF 文件路径
+        output: PathBuf,
+        /// 书签标题前缀（默认“第”→ 生成“第 1 页”）
+        #[arg(long, default_value = "第")]
+        title_prefix: String,
+        /// 自动检测页面大标题并用作书签标题
+        #[arg(long)]
+        detect_headings: bool,
+        /// 尝试按章/节编号生成分层目录
+        #[arg(long)]
+        hierarchical: bool,
+        /// 仅预览识别到的标题和层级，不写入输出 PDF
+        #[arg(long)]
+        preview_headings: bool,
+        /// 标题检测的最小字号阈值
+        #[arg(long, default_value_t = 16.0)]
+        min_font_size: f32,
+        /// 每页最多采用多少个标题候选
+        #[arg(long, default_value_t = 1)]
+        max_per_page: usize,
+        /// 自定义一级标题匹配正则
+        #[arg(long)]
+        chapter_pattern: Option<String>,
+        /// 自定义二级标题匹配正则
+        #[arg(long)]
+        section_pattern: Option<String>,
+        /// 自定义三级标题匹配正则
+        #[arg(long)]
+        subsection_pattern: Option<String>,
+        /// 标题检测失败时回退为每页一个书签
+        #[arg(long)]
+        fallback_to_pages: bool,
+        /// 即使已有目录也强制覆盖 Catalog/Outlines 引用
+        #[arg(long)]
+        force: bool,
+    },
     /// 页面操作 (删除/旋转/保留子集/重排页序)
     PageOp {
         /// 输入 PDF 文件路径
@@ -355,7 +395,7 @@ enum Commands {
     },
     /// 合并多个 PDF 为一个
     #[command(
-        after_long_help = "示例:\n  1) 合并全部页面\n     pdf-surgeon merge a.pdf b.pdf -o out.pdf\n\n  2) 所有输入文件都只取同一页范围\n     pdf-surgeon merge a.pdf b.pdf --pages 1,3,5-8 -o out.pdf\n\n  3) 每个输入文件使用各自页范围（数量需与输入文件一致）\n     pdf-surgeon merge a.pdf b.pdf c.pdf --pages 1-2 3 5-7 -o out.pdf"
+        after_long_help = "示例:\n  1) 合并全部页面\n     pdf-knife merge a.pdf b.pdf -o out.pdf\n\n  2) 所有输入文件都只取同一页范围\n     pdf-knife merge a.pdf b.pdf --pages 1,3,5-8 -o out.pdf\n\n  3) 每个输入文件使用各自页范围（数量需与输入文件一致）\n     pdf-knife merge a.pdf b.pdf c.pdf --pages 1-2 3 5-7 -o out.pdf"
     )]
     Merge {
         /// 输入文件列表 (按顺序合并)
@@ -454,7 +494,7 @@ enum Commands {
     ///
     /// 不传任何 --xxx 开关时默认全部执行
     #[command(
-        after_long_help = "示例:\n  全部清理:\n    pdf-surgeon sanitize -i a.pdf -o b.pdf\n\n  仅去除权限 + 删除签名:\n    pdf-surgeon sanitize -i a.pdf -o b.pdf --remove-perms --remove-sigs\n\n  删除注释并清除元数据:\n    pdf-surgeon sanitize -i a.pdf -o b.pdf --remove-annots --clean-meta"
+        after_long_help = "示例:\n  全部清理:\n    pdf-knife sanitize -i a.pdf -o b.pdf\n\n  仅去除权限 + 删除签名:\n    pdf-knife sanitize -i a.pdf -o b.pdf --remove-perms --remove-sigs\n\n  删除注释并清除元数据:\n    pdf-knife sanitize -i a.pdf -o b.pdf --remove-annots --clean-meta"
     )]
     Sanitize {
         /// 输入 PDF 文件路径
@@ -489,7 +529,7 @@ enum Commands {
     ///
     /// 不传任何 --xxx 类型开关时，默认同时检测并去除所有八类水印。
     #[command(
-        after_long_help = "示例:\n  去除所有类型水印:\n    pdf-surgeon remove-watermark -i a.pdf -o b.pdf\n\n  仅去除注释水印和图片水印:\n    pdf-surgeon remove-watermark -i a.pdf -o b.pdf --annot --image\n\n  用关键词精准匹配（只删含[机密]字样的水印）:\n    pdf-surgeon remove-watermark -i a.pdf -o b.pdf --keyword 机密\n\n  预览将要删除哪些内容（不写入文件）:\n    pdf-surgeon remove-watermark -i a.pdf -o b.pdf --dry-run\n\n  调低透明度阈值（默认 0.8，越小越保守）:\n    pdf-surgeon remove-watermark -i a.pdf -o b.pdf --opacity-threshold 0.5"
+        after_long_help = "示例:\n  去除所有类型水印:\n    pdf-knife remove-watermark -i a.pdf -o b.pdf\n\n  仅去除注释水印和图片水印:\n    pdf-knife remove-watermark -i a.pdf -o b.pdf --annot --image\n\n  用关键词精准匹配（只删含[机密]字样的水印）:\n    pdf-knife remove-watermark -i a.pdf -o b.pdf --keyword 机密\n\n  预览将要删除哪些内容（不写入文件）:\n    pdf-knife remove-watermark -i a.pdf -o b.pdf --dry-run\n\n  调低透明度阈值（默认 0.8，越小越保守）:\n    pdf-knife remove-watermark -i a.pdf -o b.pdf --opacity-threshold 0.5"
     )]
     RemoveWatermark {
         /// 输入 PDF 文件路径
@@ -749,6 +789,37 @@ fn run() -> anyhow::Result<()> {
         )?,
 
         Commands::Outline { input, depth } => cmd::document::outline(input, depth, &password)?,
+
+        Commands::AutoOutline {
+            input,
+            output,
+            title_prefix,
+            detect_headings,
+            hierarchical,
+            preview_headings,
+            min_font_size,
+            max_per_page,
+            chapter_pattern,
+            section_pattern,
+            subsection_pattern,
+            fallback_to_pages,
+            force,
+        } => cmd::document::auto_outline(
+            input,
+            output,
+            title_prefix,
+            detect_headings,
+            hierarchical,
+            preview_headings,
+            min_font_size,
+            max_per_page,
+            chapter_pattern,
+            section_pattern,
+            subsection_pattern,
+            fallback_to_pages,
+            force,
+            &password,
+        )?,
 
         Commands::PageOp {
             input,
